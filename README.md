@@ -8,8 +8,8 @@ This project mirrors Slack message data into a Node/Express backend (formerly Fa
 - Entrypoint: `server.js`
 - Env config (add to `.env` but do **not** commit secrets):
   - `SLACK_SIGNING_SECRET_RTC`
-  - `SLACK_CLIENT_ID_RTC` (unused in current code but present in sample env)
-  - `SLACK_CLIENT_SECRET_RTC` (unused in current code but present in sample env)
+  - `SLACK_CLIENT_ID` (unused in current code but present in sample env)
+  - `SLACK_CLIENT_SECRET` (unused in current code but present in sample env)
   - `SLACK_USER_TOKEN_RTC`
   - `SLACK_USER_TOKEN_BETA` (named `SLACK_BOT_TOKEN_BETA` in code)
   - `SLACK_SIGNING_SECRET_BETA`
