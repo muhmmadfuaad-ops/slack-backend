@@ -1,4 +1,5 @@
 const path = require("path");
+const axios = require("axios");
 const fs = require("fs");
 const crypto = require("crypto");
 const express = require("express");
@@ -62,6 +63,32 @@ const ORG_CLIENTS = {
   rtc: clientRtc,
   // beta: clientBeta,
 };
+
+// In-memory installs loaded via OAuth (team_id -> tokens/client)
+const workspaceTokens = {};
+const workspaceClients = {};
+const TOKENS_FILE = path.join(__dirname, "workspaceTokens.json");
+const CHANNEL_NAME_CACHE = {};
+
+// Forward messages from Strateger AI (#test-channel) into RTC (#test-client)
+const FORWARD_RULES = [
+  {
+    sourceTeam: "T08EPASQ09H", // Strateger AI team_id
+    sourceChannelName: "test-channel",
+    targetTeam: TEAM_RTC,
+    targetChannelName: "test-client",
+    sourceChannelId: null,
+    targetChannelId: null,
+  },
+  {
+    sourceTeam: TEAM_RTC,
+    sourceChannelName: "test-client",
+    targetTeam: "T08EPASQ09H", // Strateger AI team_id
+    targetChannelName: "test-channel",
+    sourceChannelId: null,
+    targetChannelId: null,
+  },
+];
 
 const swaggerDocument = {
   openapi: "3.0.0",
@@ -289,6 +316,72 @@ function httpError(status, detail) {
 
 function getOrgMeta(orgId) {
   return ORGANIZATIONS_META.find((o) => o.id === orgId);
+}
+
+function getClientForTeam(teamId) {
+  if (teamId === TEAM_RTC) return clientRtc;
+  if (teamId === TEAM_BETA) return clientBeta;
+  const dynamicClient = workspaceClients[teamId];
+  if (dynamicClient) return dynamicClient;
+  throw httpError(400, `Unknown team_id ${teamId}`);
+}
+
+function persistWorkspaceTokens() {
+  try {
+    fs.writeFileSync(TOKENS_FILE, JSON.stringify(workspaceTokens, null, 2), "utf8");
+  } catch (err) {
+    console.error("Failed to persist workspace tokens:", err.message || err);
+  }
+}
+
+function rememberWorkspaceInstall(teamId, botToken, userToken, shouldPersist = true) {
+  const tokenToUse = userToken || botToken;
+  workspaceTokens[teamId] = { botToken, userToken };
+  if (tokenToUse) {
+    workspaceClients[teamId] = new WebClient(tokenToUse);
+  }
+  if (shouldPersist) persistWorkspaceTokens();
+}
+
+function loadWorkspaceTokensFromDisk() {
+  if (!fs.existsSync(TOKENS_FILE)) return;
+  try {
+    const raw = fs.readFileSync(TOKENS_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const entries = Object.entries(parsed);
+      for (const [teamId, tokens] of entries) {
+        if (!tokens) continue;
+        rememberWorkspaceInstall(teamId, tokens.botToken, tokens.userToken, false);
+      }
+      if (entries.length) {
+        console.log(`Loaded workspace tokens for ${entries.length} team(s) from disk`);
+      }
+    }
+  } catch (err) {
+    console.error("Failed to load workspace tokens:", err.message || err);
+  }
+}
+
+loadWorkspaceTokensFromDisk();
+
+function cacheChannelId(teamId, channelName, channelId) {
+  if (!CHANNEL_NAME_CACHE[teamId]) CHANNEL_NAME_CACHE[teamId] = {};
+  CHANNEL_NAME_CACHE[teamId][channelName] = channelId;
+}
+
+function getCachedChannelId(teamId, channelName) {
+  return CHANNEL_NAME_CACHE[teamId]?.[channelName];
+}
+
+async function resolveChannelIdByName(client, teamId, channelName) {
+  const cached = getCachedChannelId(teamId, channelName);
+  if (cached) return cached;
+  const channels = await fetchConversations(client, "public_channel,private_channel");
+  const match = channels.find((c) => c.name === channelName);
+  if (!match) throw httpError(404, `Channel ${channelName} not found in team ${teamId}`);
+  cacheChannelId(teamId, channelName, match.id);
+  return match.id;
 }
 
 function getClientForOrg(orgId) {
@@ -613,14 +706,13 @@ function verifySlackSignature(secret, timestamp, rawBody, slackSig) {
   }
 }
 
-async function logMessageEvent(teamId, event, eventId = "") {
+async function logMessageEvent(teamId, client, event, eventId = "") {
   if (event.type !== "message" || event.bot_id) return;
   const user = event.user;
   const text = event.text;
   const channel = event.channel;
   const ts = event.ts;
   const msgTime = tsToDatetime(ts);
-  const client = teamId === TEAM_RTC ? clientRtc : clientBeta;
   try {
     console.log(`[${msgTime}] [IN ${teamId}] user=${user} channel=${channel} text=${text} event_id=${eventId}`);
     await printUserInfo(client, user, teamId);
@@ -630,6 +722,46 @@ async function logMessageEvent(teamId, event, eventId = "") {
     }
   } catch (err) {
     console.error(`Error handling message event ${eventId}:`, err.message || err);
+  }
+}
+
+async function ensureForwardRuleChannels(rule) {
+  if (!rule.sourceChannelId) {
+    const sourceClient = getClientForTeam(rule.sourceTeam);
+    rule.sourceChannelId = await resolveChannelIdByName(sourceClient, rule.sourceTeam, rule.sourceChannelName);
+  }
+  if (!rule.targetChannelId) {
+    const targetClient = getClientForTeam(rule.targetTeam);
+    rule.targetChannelId = await resolveChannelIdByName(targetClient, rule.targetTeam, rule.targetChannelName);
+  }
+}
+
+async function maybeForwardMessage(teamId, client, event) {
+  if (event.type !== "message" || event.bot_id) return;
+  for (const rule of FORWARD_RULES) {
+    if (rule.sourceTeam !== teamId) continue;
+    try {
+      await ensureForwardRuleChannels(rule);
+      if (rule.sourceChannelId && event.channel === rule.sourceChannelId) {
+        const targetClient = getClientForTeam(rule.targetTeam);
+        const userLabel = await getUserLabel(client, event.user, {});
+        const text = event.text || "";
+        const outbound = `[${rule.sourceChannelName}] ${userLabel.name || event.user}: ${text}`;
+        await targetClient.chat.postMessage({
+          channel: rule.targetChannelId,
+          text: outbound,
+        });
+        const now = new Date().toISOString().replace("T", " ").split(".")[0];
+        console.log(
+          `[${now}] Forwarded message ${event.ts} from ${rule.sourceTeam}#${rule.sourceChannelName} to ${rule.targetTeam}#${rule.targetChannelName}`
+        );
+      }
+    } catch (err) {
+      console.error(
+        `Failed to forward message from ${rule.sourceTeam}#${rule.sourceChannelName}:`,
+        err.message || err
+      );
+    }
   }
 }
 
@@ -679,11 +811,13 @@ app.post("/slack/events", async (req, res, next) => {
   try {
     const timestamp = req.headers["x-slack-request-timestamp"];
     const slackSig = req.headers["x-slack-signature"];
-    const rawBody = req.body instanceof Buffer ? req.body.toString("utf8") : "";
+    const rawBody =
+      req.body instanceof Buffer ? req.body.toString("utf8") : typeof req.body === "string" ? req.body : "";
     if (!rawBody) throw httpError(400, "Empty body");
 
     const validRtc = verifySlackSignature(SLACK_SIGNING_SECRET_RTC, timestamp, rawBody, slackSig);
     const validBeta = verifySlackSignature(SLACK_SIGNING_SECRET_BETA, timestamp, rawBody, slackSig);
+    if (!validRtc && !validBeta) throw httpError(403, "Invalid signature");
 
     let payload;
     try {
@@ -696,12 +830,8 @@ app.post("/slack/events", async (req, res, next) => {
       return res.json({ challenge: payload.challenge });
     }
 
-    const teamId = payload.team_id;
+    const teamId = payload.team_id || payload.team?.id || payload.event?.team;
     if (!teamId) throw httpError(400, "Missing team_id");
-
-    if (teamId === TEAM_RTC && !validRtc) throw httpError(403, "Invalid RTC signature");
-    if (teamId === TEAM_BETA && !validBeta) throw httpError(403, "Invalid BETA signature");
-    if (teamId !== TEAM_RTC && teamId !== TEAM_BETA) throw httpError(400, "Unknown team_id");
 
     const event = payload.event || {};
     const eventId = payload.event_id;
@@ -710,8 +840,17 @@ app.post("/slack/events", async (req, res, next) => {
       return res.json({ ok: true, duplicate: true });
     }
 
+    let clientForTeam;
+    try {
+      clientForTeam = getClientForTeam(teamId);
+    } catch (err) {
+      console.warn(`Received Slack event for unknown team_id=${teamId}; acknowledging to avoid retries.`);
+      return res.json({ ok: true, ignored: "unknown_team" });
+    }
+
     if (event.type === "message" && !event.bot_id) {
-      setImmediate(() => logMessageEvent(teamId, event, eventId));
+      setImmediate(() => logMessageEvent(teamId, clientForTeam, event, eventId));
+      setImmediate(() => maybeForwardMessage(teamId, clientForTeam, event));
     }
 
     res.json({ ok: true });
@@ -724,11 +863,7 @@ app.post("/reply", async (req, res, next) => {
   try {
     const { team_id, channel, text, thread_ts } = req.body || {};
     if (!team_id || !channel || !text) throw httpError(400, "team_id, channel, and text are required");
-    let client;
-    if (team_id === TEAM_RTC) client = clientRtc;
-    else if (team_id === TEAM_BETA) client = clientBeta;
-    else throw httpError(400, "Unknown team_id");
-
+    const client = getClientForTeam(team_id);
     const resp = await client.chat.postMessage({ channel, text, thread_ts });
     const now = new Date().toISOString().replace("T", " ").split(".")[0];
     console.log(`[${now}] [OUT ${team_id}] channel=${channel} ts=${resp.ts} text=${text}`);
@@ -742,10 +877,7 @@ app.post("/reply", async (req, res, next) => {
 app.get("/test/user/:team_id/:user_id", async (req, res, next) => {
   try {
     const { team_id, user_id } = req.params;
-    let client;
-    if (team_id === TEAM_RTC) client = clientRtc;
-    else if (team_id === TEAM_BETA) client = clientBeta;
-    else throw httpError(400, "Unknown team_id");
+    const client = getClientForTeam(team_id);
     await printUserInfo(client, user_id, team_id);
     res.json(await getUserInfo(client, user_id));
   } catch (err) {
@@ -756,10 +888,7 @@ app.get("/test/user/:team_id/:user_id", async (req, res, next) => {
 app.get("/test/channel/:team_id/:channel_id", async (req, res, next) => {
   try {
     const { team_id, channel_id } = req.params;
-    let client;
-    if (team_id === TEAM_RTC) client = clientRtc;
-    else if (team_id === TEAM_BETA) client = clientBeta;
-    else throw httpError(400, "Unknown team_id");
+    const client = getClientForTeam(team_id);
     await printChannelInfo(client, channel_id, team_id);
     res.json(await getChannelInfo(client, channel_id));
   } catch (err) {
@@ -770,10 +899,7 @@ app.get("/test/channel/:team_id/:channel_id", async (req, res, next) => {
 app.get("/test/workspace/:team_id", async (req, res, next) => {
   try {
     const { team_id } = req.params;
-    let client;
-    if (team_id === TEAM_RTC) client = clientRtc;
-    else if (team_id === TEAM_BETA) client = clientBeta;
-    else throw httpError(400, "Unknown team_id");
+    const client = getClientForTeam(team_id);
     const workspaceInfo = await getWorkspaceInfo(client);
     const now = new Date().toISOString().replace("T", " ").split(".")[0];
     console.log("\n" + "=".repeat(60));
@@ -803,9 +929,6 @@ app.get("/test/history/:team_id/:channel_id", async (req, res, next) => {
     next(err);
   }
 });
-
-// Example in-memory store (same behavior as this.workspaceTokens)
-const workspaceTokens = {};
 
 app.get('/slack/oauth/callback', async (req, res, next) => {
   try {
@@ -849,9 +972,10 @@ app.get('/slack/oauth/callback', async (req, res, next) => {
 
     // Step 2: Extract tokens and team info
     const teamId = slackResponse.team?.id;
+    const botToken = slackResponse.access_token; // xoxb-...
     const userToken = slackResponse.authed_user?.access_token; // xoxp-...
 
-    if (!teamId || !userToken) {
+    if (!teamId || (!botToken && !userToken)) {
       console.error('Invalid Slack OAuth response:', slackResponse);
       return res
         .status(500)
@@ -859,8 +983,8 @@ app.get('/slack/oauth/callback', async (req, res, next) => {
     }
 
     // Step 3: Save token (DB recommended in production)
-    workspaceTokens[teamId] = userToken;
-    console.log(`✅ Installed in ${teamId}: ${userToken}`);
+    rememberWorkspaceInstall(teamId, botToken, userToken);
+    console.log(`✅ Installed in ${teamId}: ${userToken || botToken}`);
 
     // Step 4: Respond
     res.json({
@@ -887,4 +1011,3 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`Node Slack backend listening on port ${PORT}`);
 });
-
