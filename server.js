@@ -804,6 +804,76 @@ app.get("/test/history/:team_id/:channel_id", async (req, res, next) => {
   }
 });
 
+// Example in-memory store (same behavior as this.workspaceTokens)
+const workspaceTokens = {};
+
+app.get('/slack/oauth/callback', async (req, res, next) => {
+  try {
+    const SLACK_CLIENT_ID = process.env.SLACK_CLIENT_ID_RTC;
+    const SLACK_CLIENT_SECRET = process.env.SLACK_CLIENT_SECRET_RTC;
+    const REDIRECT_URI = process.env.REDIRECT_URI;
+
+    const { code } = req.query;
+
+    const { user, team, channel, text } = req.query;
+    const displayEvent = { user, team, channel, text };
+    console.log('displayEvent:', displayEvent);
+
+    if (!code) {
+      return res.status(400).json({ detail: 'Authorization code is missing' });
+    }
+
+    // Step 1: Exchange code for tokens
+    const response = await axios.post(
+      'https://slack.com/api/oauth.v2.access',
+      null,
+      {
+        params: {
+          client_id: SLACK_CLIENT_ID,
+          client_secret: SLACK_CLIENT_SECRET,
+          code: code,
+          redirect_uri: REDIRECT_URI,
+        },
+      }
+    );
+
+    const slackResponse = response.data;
+    console.log('slackResponse:', JSON.stringify(slackResponse, null, 2));
+
+    if (!slackResponse.ok) {
+      console.error('Slack OAuth error:', slackResponse.error);
+      return res
+        .status(400)
+        .json({ detail: `OAuth failed: ${slackResponse.error}` });
+    }
+
+    // Step 2: Extract tokens and team info
+    const teamId = slackResponse.team?.id;
+    const userToken = slackResponse.authed_user?.access_token; // xoxp-...
+
+    if (!teamId || !userToken) {
+      console.error('Invalid Slack OAuth response:', slackResponse);
+      return res
+        .status(500)
+        .json({ detail: 'Invalid Slack OAuth response' });
+    }
+
+    // Step 3: Save token (DB recommended in production)
+    workspaceTokens[teamId] = userToken;
+    console.log(`✅ Installed in ${teamId}: ${userToken}`);
+
+    // Step 4: Respond
+    res.json({
+      ok: true,
+      message: 'App installed successfully',
+      team_id: teamId,
+    });
+  } catch (err) {
+    console.error('Error during Slack OAuth:', err.message || err);
+    next(err);
+  }
+});
+
 // Swagger UI docs
 app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerDocument, { explorer: true }));
 
@@ -817,3 +887,4 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`Node Slack backend listening on port ${PORT}`);
 });
+
