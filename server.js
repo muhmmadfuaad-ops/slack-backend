@@ -61,21 +61,45 @@ const workspaceClients = {};
 const TOKENS_FILE = path.join(__dirname, "workspaceTokens.json");
 const CHANNEL_NAME_CACHE = {};
 
-// Forward messages from Strateger AI (#test-channel) into the primary workspace (#test-client)
+// Forwarding rules between workspaces
+// - Strateger AI (T08EPASQ09H) -> RTC channel "stratger-ai" (prefix with source channel + user)
+// - RTC "stratger-ai" -> Strateger AI (no prefix)
+// - First Project (T0A908P8HMJ) dev-team -> RTC "first-project" (prefix with source channel + user)
+// - RTC "first-project" -> First Project dev-team (no prefix)
 const FORWARD_RULES = [
   {
-    sourceTeam: "T08EPASQ09H", // Strateger AI team_id
-    sourceChannelName: "test-channel",
+    sourceTeam: "T08EPASQ09H",
+    sourceChannelName: "*", // all channels
     targetTeam: PRIMARY_TEAM_ID,
-    targetChannelName: "test-client",
+    targetChannelName: "strateger-ai",
+    includePrefix: true,
     sourceChannelId: null,
     targetChannelId: null,
   },
   {
     sourceTeam: PRIMARY_TEAM_ID,
-    sourceChannelName: "test-client",
-    targetTeam: "T08EPASQ09H", // Strateger AI team_id
-    targetChannelName: "test-channel",
+    sourceChannelName: "strateger-ai",
+    targetTeam: "T08EPASQ09H",
+    targetChannelName: "dev-team",
+    includePrefix: false,
+    sourceChannelId: null,
+    targetChannelId: null,
+  },
+  {
+    sourceTeam: "T0A908P8HMJ",
+    sourceChannelName: "dev-team",
+    targetTeam: PRIMARY_TEAM_ID,
+    targetChannelName: "first-project",
+    includePrefix: true,
+    sourceChannelId: null,
+    targetChannelId: null,
+  },
+  {
+    sourceTeam: PRIMARY_TEAM_ID,
+    sourceChannelName: "first-project",
+    targetTeam: "T0A908P8HMJ",
+    targetChannelName: "dev-team",
+    includePrefix: false,
     sourceChannelId: null,
     targetChannelId: null,
   },
@@ -314,6 +338,13 @@ function getClientForTeam(teamId) {
   const dynamicClient = workspaceClients[teamId];
   if (dynamicClient) return dynamicClient;
   throw httpError(400, `Unknown team_id ${teamId}`);
+}
+
+function getTokenForTeam(teamId) {
+  if (teamId === PRIMARY_TEAM_ID) return SLACK_USER_TOKEN;
+  const tokens = workspaceTokens[teamId];
+  if (!tokens) return null;
+  return tokens.userToken || tokens.botToken || null;
 }
 
 function persistWorkspaceTokens() {
@@ -716,7 +747,7 @@ async function logMessageEvent(teamId, client, event, eventId = "") {
 }
 
 async function ensureForwardRuleChannels(rule) {
-  if (!rule.sourceChannelId) {
+  if (rule.sourceChannelName !== "*" && !rule.sourceChannelId) {
     const sourceClient = getClientForTeam(rule.sourceTeam);
     rule.sourceChannelId = await resolveChannelIdByName(sourceClient, rule.sourceTeam, rule.sourceChannelName);
   }
@@ -726,26 +757,103 @@ async function ensureForwardRuleChannels(rule) {
   }
 }
 
+async function buildFileLinks(client, files = []) {
+  const links = [];
+  for (const file of files) {
+    let link = file.permalink_public || file.permalink;
+    if (!link && file.id) {
+      try {
+        const resp = await client.files.sharedPublicURL({ file: file.id });
+        link = resp.file?.permalink_public || resp.file?.permalink;
+      } catch (err) {
+        console.error(`Failed to fetch public link for file ${file.id}:`, err.data?.error || err.message);
+      }
+    }
+    if (link) {
+      const label = file.name || file.title || "file";
+      links.push(`${label}: ${link}`);
+    }
+  }
+  return links;
+}
+
 async function maybeForwardMessage(teamId, client, event) {
   if (event.type !== "message" || event.bot_id) return;
   for (const rule of FORWARD_RULES) {
     if (rule.sourceTeam !== teamId) continue;
     try {
       await ensureForwardRuleChannels(rule);
-      if (rule.sourceChannelId && event.channel === rule.sourceChannelId) {
-        const targetClient = getClientForTeam(rule.targetTeam);
+
+      let sourceMatches = false;
+      if (rule.sourceChannelName === "*") {
+        sourceMatches = true;
+      } else {
+        sourceMatches = rule.sourceChannelId && event.channel === rule.sourceChannelId;
+      }
+      if (!sourceMatches) continue;
+
+      const targetClient = getClientForTeam(rule.targetTeam);
+      const files = event.files || [];
+      const fileLinks = await buildFileLinks(client, files);
+      const bodyParts = [];
+      if (event.text) bodyParts.push(event.text);
+      if (fileLinks.length) bodyParts.push(fileLinks.join("\n"));
+      const content = bodyParts.join("\n");
+      let outbound = content || "[no content]";
+
+      if (rule.includePrefix) {
         const userLabel = await getUserLabel(client, event.user, {});
-        const text = event.text || "";
-        const outbound = `[${rule.sourceChannelName}] ${userLabel.name || event.user}: ${text}`;
+        let sourceLabel = rule.sourceChannelName;
+        if (rule.sourceChannelName === "*") {
+          const info = await getChannelInfo(client, event.channel);
+          sourceLabel = info.name || event.channel;
+        }
+        outbound = `[${sourceLabel}] ${userLabel.name || event.user}: ${content}`;
+      }
+
+      let uploaded = false;
+      if (files.length) {
+        const sourceToken = getTokenForTeam(rule.sourceTeam);
+        if (!sourceToken) {
+          console.warn(`No token available to download files for team ${rule.sourceTeam}`);
+        } else {
+          for (let i = 0; i < files.length; i += 1) {
+            const file = files[i];
+            const downloadUrl = file.url_private_download || file.url_private;
+            if (!downloadUrl) continue;
+            try {
+              const resp = await axios.get(downloadUrl, {
+                responseType: "arraybuffer",
+                headers: { Authorization: `Bearer ${sourceToken}` },
+              });
+              const filename = file.name || file.title || `file-${Date.now()}-${i}`;
+              await targetClient.files.uploadV2({
+                channel_id: rule.targetChannelId,
+                filename,
+                file: Buffer.from(resp.data),
+                initial_comment: uploaded ? undefined : outbound,
+              });
+              uploaded = true;
+            } catch (err) {
+              console.error(
+                `Failed to mirror file ${file.id || file.name || file.title || "unknown"} from ${rule.sourceTeam}:`,
+                err.data?.error || err.message
+              );
+            }
+          }
+        }
+      }
+
+      if (!uploaded) {
         await targetClient.chat.postMessage({
           channel: rule.targetChannelId,
           text: outbound,
         });
-        const now = new Date().toISOString().replace("T", " ").split(".")[0];
-        console.log(
-          `[${now}] Forwarded message ${event.ts} from ${rule.sourceTeam}#${rule.sourceChannelName} to ${rule.targetTeam}#${rule.targetChannelName}`
-        );
       }
+      const now = new Date().toISOString().replace("T", " ").split(".")[0];
+      console.log(
+        `[${now}] Forwarded message ${event.ts} from ${rule.sourceTeam}#${rule.sourceChannelName} to ${rule.targetTeam}#${rule.targetChannelName}`
+      );
     } catch (err) {
       console.error(
         `Failed to forward message from ${rule.sourceTeam}#${rule.sourceChannelName}:`,
