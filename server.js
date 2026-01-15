@@ -23,13 +23,9 @@ function requireEnv(name) {
 }
 
 // Environment
-const SLACK_SIGNING_SECRET_RTC = requireEnv("SLACK_SIGNING_SECRET_RTC");
-const SLACK_USER_TOKEN_RTC = requireEnv("SLACK_USER_TOKEN_RTC");
-const TEAM_RTC = requireEnv("TEAM_RTC");
-
-const SLACK_SIGNING_SECRET_BETA = requireEnv("SLACK_SIGNING_SECRET_BETA");
-const SLACK_BOT_TOKEN_BETA = requireEnv("SLACK_BOT_TOKEN_BETA");
-const TEAM_BETA = requireEnv("TEAM_BETA");
+const SLACK_SIGNING_SECRET = requireEnv("SLACK_SIGNING_SECRET");
+const SLACK_USER_TOKEN = requireEnv("SLACK_USER_TOKEN");
+const PRIMARY_TEAM_ID = requireEnv("PRIMARY_TEAM_ID");
 
 const LOG_HISTORY = (process.env.LOG_HISTORY || "false").toLowerCase() === "true";
 const HISTORY_LOOKBACK_SECONDS = 12 * 60 * 60;
@@ -37,31 +33,26 @@ const EVENT_TTL_SECONDS = 300;
 const PROCESSED_EVENTS = new Map();
 
 // Slack clients
-const clientRtc = new WebClient(SLACK_USER_TOKEN_RTC);
-const clientBeta = new WebClient(SLACK_BOT_TOKEN_BETA);
+const primaryClient = new WebClient(SLACK_USER_TOKEN);
 
+const PRIMARY_ORG_ID = process.env.PRIMARY_ORG_ID || "rtc";
+const PRIMARY_ORG_NAME = process.env.PRIMARY_ORG_NAME || "Primary Workspace";
+const PRIMARY_ORG_STATUS = process.env.PRIMARY_ORG_STATUS || "Active workspace";
+const PRIMARY_ORG_INITIALS = process.env.PRIMARY_ORG_INITIALS || "PW";
+const PRIMARY_ORG_ACCENT = process.env.PRIMARY_ORG_ACCENT || "#8E6CF5";
 const ORGANIZATIONS_META = [
   {
-    id: "rtc",
-    team_id: TEAM_RTC,
-    name: "RTC League",
-    status: "Free trial in progress",
-    initials: "RL",
-    accent: "#8E6CF5",
+    id: PRIMARY_ORG_ID,
+    team_id: PRIMARY_TEAM_ID,
+    name: PRIMARY_ORG_NAME,
+    status: PRIMARY_ORG_STATUS,
+    initials: PRIMARY_ORG_INITIALS,
+    accent: PRIMARY_ORG_ACCENT,
   },
-  // {
-  //   id: "beta",
-  //   team_id: TEAM_BETA,
-  //   name: "Beta Crew",
-  //   status: "Active workspace",
-  //   initials: "BC",
-  //   accent: "#F06867",
-  // },
 ];
 
 const ORG_CLIENTS = {
-  rtc: clientRtc,
-  // beta: clientBeta,
+  [PRIMARY_ORG_ID]: primaryClient,
 };
 
 // In-memory installs loaded via OAuth (team_id -> tokens/client)
@@ -70,18 +61,18 @@ const workspaceClients = {};
 const TOKENS_FILE = path.join(__dirname, "workspaceTokens.json");
 const CHANNEL_NAME_CACHE = {};
 
-// Forward messages from Strateger AI (#test-channel) into RTC (#test-client)
+// Forward messages from Strateger AI (#test-channel) into the primary workspace (#test-client)
 const FORWARD_RULES = [
   {
     sourceTeam: "T08EPASQ09H", // Strateger AI team_id
     sourceChannelName: "test-channel",
-    targetTeam: TEAM_RTC,
+    targetTeam: PRIMARY_TEAM_ID,
     targetChannelName: "test-client",
     sourceChannelId: null,
     targetChannelId: null,
   },
   {
-    sourceTeam: TEAM_RTC,
+    sourceTeam: PRIMARY_TEAM_ID,
     sourceChannelName: "test-client",
     targetTeam: "T08EPASQ09H", // Strateger AI team_id
     targetChannelName: "test-channel",
@@ -95,7 +86,7 @@ const swaggerDocument = {
   info: {
     title: "Slack Mirror API",
     version: "1.0.0",
-    description: "Node backend mirroring Slack conversations for RTC/Beta.",
+    description: "Node backend mirroring Slack conversations across workspaces.",
   },
   servers: [{ url: "/" }],
   components: {
@@ -319,8 +310,7 @@ function getOrgMeta(orgId) {
 }
 
 function getClientForTeam(teamId) {
-  if (teamId === TEAM_RTC) return clientRtc;
-  if (teamId === TEAM_BETA) return clientBeta;
+  if (teamId === PRIMARY_TEAM_ID) return primaryClient;
   const dynamicClient = workspaceClients[teamId];
   if (dynamicClient) return dynamicClient;
   throw httpError(400, `Unknown team_id ${teamId}`);
@@ -815,9 +805,8 @@ app.post("/slack/events", async (req, res, next) => {
       req.body instanceof Buffer ? req.body.toString("utf8") : typeof req.body === "string" ? req.body : "";
     if (!rawBody) throw httpError(400, "Empty body");
 
-    const validRtc = verifySlackSignature(SLACK_SIGNING_SECRET_RTC, timestamp, rawBody, slackSig);
-    const validBeta = verifySlackSignature(SLACK_SIGNING_SECRET_BETA, timestamp, rawBody, slackSig);
-    if (!validRtc && !validBeta) throw httpError(403, "Invalid signature");
+    const validSignature = verifySlackSignature(SLACK_SIGNING_SECRET, timestamp, rawBody, slackSig);
+    if (!validSignature) throw httpError(403, "Invalid signature");
 
     let payload;
     try {
@@ -919,10 +908,7 @@ app.get("/test/history/:team_id/:channel_id", async (req, res, next) => {
   try {
     const { team_id, channel_id } = req.params;
     const { limit = 50 } = req.query;
-    let client;
-    if (team_id === TEAM_RTC) client = clientRtc;
-    else if (team_id === TEAM_BETA) client = clientBeta;
-    else throw httpError(400, "Unknown team_id");
+    const client = getClientForTeam(team_id);
     await printMessageHistory(client, channel_id, team_id, Number(limit));
     res.json({ messages: await fetchChannelHistory(client, channel_id, Number(limit)) });
   } catch (err) {
@@ -932,8 +918,8 @@ app.get("/test/history/:team_id/:channel_id", async (req, res, next) => {
 
 app.get('/slack/oauth/callback', async (req, res, next) => {
   try {
-    const SLACK_CLIENT_ID = process.env.SLACK_CLIENT_ID_RTC;
-    const SLACK_CLIENT_SECRET = process.env.SLACK_CLIENT_SECRET_RTC;
+    const SLACK_CLIENT_ID = process.env.SLACK_CLIENT_ID || process.env.SLACK_CLIENT_ID_RTC;
+    const SLACK_CLIENT_SECRET = process.env.SLACK_CLIENT_SECRET || process.env.SLACK_CLIENT_SECRET_RTC;
     const REDIRECT_URI = process.env.REDIRECT_URI;
 
     const { code } = req.query;

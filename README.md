@@ -1,20 +1,18 @@
 # Slack Mirror (FastAPI + React)
 
-This project mirrors Slack message data into a Node/Express backend (formerly FastAPI) and a Vite/React frontend with a Slack-like UI. It supports two Slack workspaces (RTC and Beta), lists channels/DMs, shows message history, and opens threads.
+This project mirrors Slack message data into a Node/Express backend (formerly FastAPI) and a Vite/React frontend with a Slack-like UI. It can bridge messages across multiple Slack workspaces, list channels/DMs, show message history, and open threads.
 
 ## Backend (Node/Express)
 
 - Tech: Node 18+, Express, @slack/web-api
 - Entrypoint: `server.js`
 - Env config (add to `.env` but do **not** commit secrets):
-  - `SLACK_SIGNING_SECRET_RTC`
-  - `SLACK_CLIENT_ID_RTC` (unused in current code but present in sample env)
-  - `SLACK_CLIENT_SECRET_RTC` (unused in current code but present in sample env)
-  - `SLACK_USER_TOKEN_RTC`
-  - `SLACK_USER_TOKEN_BETA` (named `SLACK_BOT_TOKEN_BETA` in code)
-  - `SLACK_SIGNING_SECRET_BETA`
-  - `TEAM_RTC`
-  - `TEAM_BETA`
+  - `SLACK_SIGNING_SECRET`
+  - `SLACK_CLIENT_ID`
+  - `SLACK_CLIENT_SECRET`
+  - `SLACK_USER_TOKEN` (primary workspace token)
+  - `PRIMARY_TEAM_ID`
+  - Optional display overrides: `PRIMARY_ORG_ID`, `PRIMARY_ORG_NAME`, `PRIMARY_ORG_STATUS`, `PRIMARY_ORG_INITIALS`, `PRIMARY_ORG_ACCENT`
 
 ### Run backend
 ```bash
